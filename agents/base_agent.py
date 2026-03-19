@@ -758,13 +758,6 @@ class BaseAgent(ABC):
             # Show more trailing context so the LLM can reliably find
             # the cut-off point and avoid re-emitting class/method headers.
             tail_chars = min(600, len(content))
-            # Cap the re-sent prompt to avoid token explosion on large fix/generation
-            # prompts.  Large prompts (e.g. a 200-line Java file as fix context) can
-            # exceed 15k chars; re-sending the full prompt on each continuation multiplies
-            # token usage by the continuation count.  The first _CONTINUATION_PROMPT_CTX_CHARS
-            # chars provide enough context (file path, purpose, key instructions) for the
-            # model to orient itself; the tail of the already-written content then guides
-            # the continuation directly.
             prompt_context = (
                 user_prompt if len(user_prompt) <= self._CONTINUATION_PROMPT_CTX_CHARS
                 else user_prompt[:self._CONTINUATION_PROMPT_CTX_CHARS] + "\n...[context trimmed for continuation]...\n"
@@ -927,12 +920,25 @@ class BaseAgent(ABC):
         self._metrics["llm_calls"] += 1
         return result
 
-    def _format_context(self, context: AgentContext) -> str:
+    def _format_context(
+        self,
+        context: AgentContext,
+        *,
+        exclude_target: bool = False,
+    ) -> str:
         """Format agent context into a prompt section.
 
         The primary file (matching the current task's file_blueprint) gets full
         content to prevent truncation of critical method signatures. Dependency
         files are truncated at 4000 chars to stay within token budget.
+
+        Args:
+            context: The agent context to format.
+            exclude_target: When ``True``, the primary target file is omitted
+                from the "Related Files" block.  Use this when the caller is
+                going to render that file separately (e.g. with line numbers in
+                the reviewer) to avoid including the same content twice and
+                paying double the token cost.
         """
         parts: list[str] = []
 
@@ -976,26 +982,46 @@ class BaseAgent(ABC):
             parts.append("\n".join(contract_lines))
 
         if context.related_files:
-            parts.append("## Related Files")
-            # Determine the primary file path to give it full content
+            # Determine the primary file path — used for full-content treatment
+            # and optionally for exclusion when exclude_target=True.
             primary_path = context.file_blueprint.path if context.file_blueprint else None
+
+            # Detect the blueprint language once (same for all files in context)
+            # to avoid calling get_language_profile on every iteration.
+            primary_lang_name = ""
+            if context.file_blueprint:
+                primary_lang_name = get_language_profile(
+                    context.file_blueprint.language
+                ).code_fence_name
+
+            _EXT_FENCE = {
+                ".py": "python", ".java": "java", ".go": "go",
+                ".ts": "typescript", ".rs": "rust", ".cs": "csharp",
+            }
+
+            file_parts: list[str] = []
             for path, content in context.related_files.items():
+                # Skip the target file when the caller will render it separately.
+                if exclude_target and path == primary_path:
+                    continue
                 # Primary file gets full content; dependencies get truncated
                 if path == primary_path:
                     truncated = content
                 else:
                     truncated = content[:4000] if len(content) > 4000 else content
-                # Detect language from file extension for correct code fencing
-                lang_name = ""
-                if context.file_blueprint:
-                    lang_name = get_language_profile(context.file_blueprint.language).code_fence_name
+                # Use the blueprint language for the primary file; for dependency
+                # files fall back to extension-based detection so the fence label
+                # matches the actual file language (e.g. a Java dep in a TS project).
+                lang_name = primary_lang_name if path == primary_path else ""
                 if not lang_name:
-                    for ext, fence in {".py": "python", ".java": "java", ".go": "go",
-                                       ".ts": "typescript", ".rs": "rust", ".cs": "csharp"}.items():
+                    for ext, fence in _EXT_FENCE.items():
                         if path.endswith(ext):
                             lang_name = fence
                             break
-                parts.append(f"### {path}\n```{lang_name}\n{truncated}\n```")
+                file_parts.append(f"### {path}\n```{lang_name}\n{truncated}\n```")
+
+            if file_parts:
+                parts.append("## Related Files\n" + "\n\n".join(file_parts))
 
         if context.dependency_info:
             deps = context.dependency_info

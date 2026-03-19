@@ -118,16 +118,24 @@ class ReviewerAgent(BaseAgent):
 
     async def _review_file(self, context: AgentContext) -> ReviewResult:
         """Review a single file."""
-        formatted = self._format_context(context)
-        
-        # Explicitly append the target file content with line numbers for the reviewer
-        target_file_content = await self.repo.async_read_file(context.task.file)
+        # Build the context string, but exclude the target file from the generic
+        # "Related Files" section so it is only rendered once — below, with line
+        # numbers — rather than twice at double the token cost.
+        formatted = self._format_context(context, exclude_target=True)
+
+        # Use the file content already assembled by ContextBuilder to avoid a
+        # redundant async disk read on every review call.  Fall back to a direct
+        # read only when the file was not included in the context (safety net).
+        target_file_content: str = context.related_files.get(context.task.file, "")
+        if not target_file_content:
+            target_file_content = await self.repo.async_read_file(context.task.file) or ""
+
         if target_file_content:
             numbered_lines = []
             for i, line in enumerate(target_file_content.splitlines(), start=1):
                 numbered_lines.append(f"{i:4d} | {line}")
             numbered_content = "\n".join(numbered_lines)
-            
+
             # Extract language name for code fence
             lang_name = ""
             if context.file_blueprint and context.file_blueprint.language:
